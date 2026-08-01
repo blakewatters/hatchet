@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from io import StringIO
 from types import SimpleNamespace
 from typing import cast
 
@@ -13,6 +12,7 @@ from hatchet_sdk.worker.runner.utils.capture_logs import (
     AsyncLogSender,
     LogForwardingHandler,
     LogRecord,
+    capture_logs,
 )
 
 
@@ -29,7 +29,7 @@ async def test_log_forwarding_handler_enqueues_correct_record() -> None:
     previous_level = target_logger.level
     target_logger.setLevel(logging.INFO)
 
-    handler = LogForwardingHandler(log_sender, StringIO())
+    handler = LogForwardingHandler(log_sender)
     target_logger.addHandler(handler)
 
     step_token = ctx_step_run_id.set("step-run-id")
@@ -53,3 +53,38 @@ async def test_log_forwarding_handler_enqueues_correct_record() -> None:
         ctx_task_retry_count.reset(retry_token)
         target_logger.removeHandler(handler)
         target_logger.setLevel(previous_level)
+
+
+async def test_capture_logs_does_not_retain_records() -> None:
+    """The handler must not hold on to records.
+
+    capture_logs wraps the worker's whole action run loop, so anything the
+    handler retains is retained for the lifetime of the worker process. It
+    previously subclassed logging.StreamHandler over a StringIO that nothing
+    ever read, so a worker's memory grew with everything it logged.
+    """
+    event_client = FakeEventClient()
+    log_sender = AsyncLogSender(cast(EventClient, event_client))
+
+    target_logger = logging.getLogger("capture-log-retention-test")
+    target_logger.setLevel(logging.INFO)
+    target_logger.propagate = False
+
+    handlers: list[logging.Handler] = []
+
+    async def run_loop() -> None:
+        handlers.extend(target_logger.handlers)
+        # No step run is set, so every one of these is a record the handler
+        # drops rather than forwards -- it must not retain them either.
+        for _ in range(10_000):
+            target_logger.info("x" * 1_024)
+
+    await capture_logs(target_logger, log_sender, run_loop)()
+
+    (handler,) = handlers
+    assert isinstance(handler, LogForwardingHandler)
+    # The handler holds no stream to accumulate into.
+    assert not hasattr(handler, "stream")
+    assert log_sender.q.empty()
+    # And capture_logs cleans up after itself.
+    assert target_logger.handlers == []
